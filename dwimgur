@@ -1,0 +1,357 @@
+#!/usr/bin/env perl
+# vim: tabstop=4 shiftwidth=4 expandtab :
+
+# Copyright (c) 2016-2020 Tamas TEVESZ <ice@extreme.hu>
+#
+# Permission to use, copy, modify, and distribute this software for any
+# purpose with or without fee is hereby granted, provided that the above
+# copyright notice and this permission notice appear in all copies.
+#
+# THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+# WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+# MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+# ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+# WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+# ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+# OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+## no critic (RegularExpressions::RequireExtendedFormatting)
+## no critic (InputOutput::RequireBriefOpen)
+## no critic (Modules::ProhibitMultiplePackages)
+
+use strictures 2;
+use 5.20.0;
+
+package Constants {
+
+    use Mojo::Base -base;
+    use Mojo::File;
+
+    has APPNAME => 'dwimgur';
+    has APIROOT => 'https://api.imgur.com/3/';
+    has SITEROOT => 'https://imgur.com';
+    has configdir => sub {
+        my $cdir = exists($ENV{XDG_CONFIG_HOME}) ?
+                    Mojo::File->new($ENV{XDG_CONFIG_HOME}) :
+                    Mojo::File->new($ENV{HOME})->child('.config');
+
+        return $cdir->child(shift->APPNAME);
+    };
+    has CLIENT_ID => sub {
+        my $client_id = Mojo::File->new(shift->configdir)->child('client_id')->slurp;
+        chomp $client_id;
+        return $client_id;
+    };
+    has authz_hdr => sub { sprintf("Client-ID %s", shift->CLIENT_ID); };
+    has histfile => sub { Mojo::File->new(shift->configdir)->child('history')->to_string; };
+
+    sub instance { state $instance = shift->new; return $instance; }
+}
+
+package Endpoint {
+
+    use overload
+        '""'    => 'to_string',
+    ;
+
+    use Mojo::Base -base;
+
+    has '_url' => sub { Constants->new->APIROOT };
+
+    sub func
+    {
+        my ($self, $func) = @_;
+
+        return $self unless $func;
+        $func =~ s{^/+|/+$}{}g;
+
+        if($self->_url !~ m{/$})
+        {
+            $self->_url($self->_url . '/');
+        }
+        $self->_url($self->_url . $func);
+
+        return $self;
+    }
+
+    sub param { goto &func; }
+
+    sub to_string
+    {
+        return shift->_url;
+    }
+}
+
+package Image {
+
+    use Mojo::Base -base;
+    use Mojo::File;
+
+    has 'path';
+    has file => sub { Mojo::File->new(shift->path)->basename };
+    has 'id';
+    has 'deletehash';
+    has 'link';
+    has uploaded => 0;
+    has delete_link => sub { sprintf("%s/delete/%s", Constants->instance->SITEROOT, shift->deletehash) };
+    has delete_command => sub {
+        sprintf("curl -X DELETE -k -s -H 'Authorization: %s' -o - %s",
+                Constants->instance->authz_hdr,
+                Endpoint->new->func('image')->param(shift->deletehash)
+        );
+    };
+    has history_line => sub {
+        my ($self) = @_;
+
+        sprintf("type=image name=[%s] link=[%s] deletelink=[%s] deletecommand=[%s]",
+                $self->file, $self->link, $self->delete_link, $self->delete_command);
+    };
+}
+
+package Album {
+
+    use Mojo::Base -base;
+
+    has 'id';
+    has link => sub { sprintf("%s/a/%s", Constants->instance->SITEROOT, shift->id) };
+    has 'deletehash';
+    has delete_command => sub {
+        return sprintf("curl -X DELETE -k -s -H 'Authorization: %s' -o - %s",
+                Constants->instance->authz_hdr,
+                Endpoint->new->func('album')->param(shift->deletehash)
+        );
+    };
+    has history_line => sub {
+        my ($self) = @_;
+        return sprintf("type=album link=[%s] deletecommand=[%s]",
+            $self->link, $self->delete_command);
+    };
+}
+
+package Logger {
+
+    use Fcntl qw(:flock SEEK_SET SEEK_END LOCK_EX LOCK_UN);
+    use POSIX qw(strftime);
+    use Mojo::Base -base;
+
+    has _initialized => 0;
+    has 'fh';
+
+    sub _init
+    {
+        my ($self) = @_;
+
+        open(my $fh, '>>', Constants->instance->histfile) or return;
+        flock($fh, LOCK_EX);
+        seek($fh, 0, SEEK_SET);
+        seek($fh, 0, SEEK_END);
+        $fh->autoflush(1);
+
+        print $fh "==============================\n";
+        print $fh strftime("%FT%T\n", localtime);
+
+        $self->fh($fh);
+        $self->_initialized(1);
+
+        return;
+    }
+
+    sub write ## no critic (Subroutines::ProhibitBuiltinHomonyms)
+    {
+        my ($self, @lines) = @_;
+
+        $self->_init unless $self->_initialized;
+        return unless $self->_initialized;
+
+        print { $self->fh } "$_\n" for @lines;
+
+        return;
+    }
+
+    sub DESTROY
+    {
+        my ($self) = @_;
+
+        if($self->fh)
+        {
+            flock($self->fh, LOCK_UN);
+            close($self->fh);
+        }
+
+        return;
+    }
+}
+
+use FindBin;
+use Image::ExifTool;
+use Mojo::Collection;
+use Mojo::File;
+use Mojo::JSON;
+use Mojo::Path;
+use Mojo::URL;
+use Mojo::UserAgent;
+use Pod::Usage;
+
+pod2usage(-exitval => 1, -verbose => 1) if !@ARGV;
+pod2usage(-exitval => 0, -verbose => 2, -noperldoc => 1) if $ARGV[0] =~ m{^--?(h(elp)?)|\?}n;
+
+my $images = Mojo::Collection->new;
+my $album = Album->new;
+my $logger = Logger->new;
+
+for my $item (@ARGV)
+{
+    if(-r $item
+       and $item =~ m{\.(jpe?g|png)$}ni)
+    {
+        push @{$images}, Image->new(path => $item);
+    }
+    else
+    {
+        say "$item: File does not exist, is not readable or not an image";
+    }
+}
+
+my $ua = Mojo::UserAgent->new;
+$ua->on(
+    start => sub { $_[1]->req->headers->authorization(Constants->instance->authz_hdr) },
+);
+
+$images->each(sub {
+    my ($item) = @_;
+
+    my $temp = Mojo::File->tempfile(
+                    DIR => $ENV{TMPDIR} || '/tmp',
+                    TEMPLATE => '.' . Constants->instance->APPNAME . '.XXXXXXXX'
+               );
+    Mojo::File->new($item->path)->copy_to($temp->to_string);
+    my $exif = Image::ExifTool->new;
+    $exif->SetNewValue('*');
+    $exif->WriteInfo($temp->to_string);
+
+    my $tx = $ua->post(Endpoint->new->func('upload')->to_string => form => {
+        image => { file => $temp->to_string },
+    });
+
+    if($tx->res->is_success)
+    {
+        my $result = $tx->res->json->{'data'};
+
+        $item->id($result->{id});
+        $item->deletehash(sanitize($result->{deletehash}));
+        $item->link($result->{link});
+
+        $logger->write($item->history_line);
+        $item->uploaded(1);
+        say "Uploaded " . $item->path;
+    }
+    else
+    {
+        if($tx->res->headers->content_type eq 'application/json')
+        {
+            my $result = $tx->res->json->{data};
+
+            say "Error while uploading $item: $result->{error}->{message}";
+        }
+        else
+        {
+            say "Unknown error while uploading $item, server replied code " . $tx->res->code;
+        }
+    }
+});
+
+my $uploaded_image_count = $images->grep(sub { $_->uploaded })->size;
+if($uploaded_image_count > 1)
+{
+    my $tx;
+
+    $tx = $ua->post(Endpoint->new->func('album')->to_string => form => {
+        deletehashes => $images->grep(sub { $_->uploaded })->map(sub { $_->deletehash })->join(','),
+        layout => 'blog',
+    });
+
+    if($tx->res->is_success)
+    {
+        my $result = $tx->res->json->{'data'};
+
+        $album->id($result->{id});
+        $album->deletehash(sanitize($result->{deletehash}));
+
+        $logger->write($album->history_line);
+    }
+    else
+    {
+        if($tx->res->headers->content_type eq 'application/json')
+        {
+            my $result = $tx->res->json->{data};
+
+            say "Error while creating album: $result->{error}->{message}";
+        }
+        else
+        {
+            say "Unknown error while creating album, server replied code " . $tx->res->code;
+        }
+    }
+}
+elsif($uploaded_image_count == 0)
+{
+    say "No images uploaded.";
+    exit 1;
+}
+
+say("File name                     Delete link                              Link");
+say("------------------------------------------------------------------------------------------------------");
+
+$images->each(sub {
+    printf("%-29s %-16s %s\n", $_->file, $_->delete_link, $_->link);
+});
+
+if(defined $album->id)
+{
+    say "Album: " . $album->link;
+}
+
+sub sanitize ## no critic (Subroutines::RequireArgUnpacking)
+{
+    return $_[0] =~ s{[^0-9a-zA-Z]}{}griaa;
+}
+
+__END__
+
+=head1 NAME
+
+B<dwimgur> - No-nonsense anonymous(-only) imgur client
+
+=head1 SYNOPSIS
+
+ dwimgur imagefile [imagefile ...]
+
+=head1 DESCRIPTION
+
+Uploads image files listed on the command line to L<imgur|https://imgur.com>. Each image is uploaded
+at most once. If more than one image is uploaded, an album (using the I<blog> layout) is also created.
+A summary, containing direct links to the uploaded images (and perhaps the album), is displayed.
+Only files with I<.jpg>, I<.jpeg> and I<.png> extensions are considered. Images are stripped of all
+EXIF tags before they are uploaded (the image files specified on the command line are left unharmed).
+
+A journal of images uploaded and albums created is recorded in F<$XDG_CONFIG_HOME/dwimgur/history>
+(defaulting to F<~/.config/dwimgur/history>). The journal also contains links and shell commands
+to delete the images and the albums.
+
+=head1 CONFIGURATION
+
+To use dwimgur, first you have to L<register with imgur|https://apidocs.imgur.com/> to get
+yourself a client ID. This client ID (B<not> the client secret - dwimgur is anonymous-only) needs
+to be jotted down in F<$XDG_CONFIG_HOME/dwimgur/client_id>, one line, no gratuitous whitespace,
+just the client ID. See imgur's API documentation for more details and instructions.
+
+=head1 CAVEATS
+
+dwimgur was written to satisfy my rather infrequent and simple needs to "just use imgur". If your needs
+don't happen to coincide with mines, you should be shopping for a different client.
+
+=head1 AUTHOR
+
+Tamas TEVESZ <ice@extreme.hu>
+
+=cut

@@ -1,0 +1,5 @@
+severity = harsh
+verbose = https://metacpan.org/pod/Perl::Critic::Policy::%p\n%f: [%p] %m at line %l, column %c: %r\n
+program-extensions = t
+
+[-ValuesAndExpressions::ProhibitVersionStrings]

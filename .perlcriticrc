@@ -3,3 +3,6 @@ verbose = https://metacpan.org/pod/Perl::Critic::Policy::%p\n%f: [%p] %m at line
 program-extensions = t
 
 [-ValuesAndExpressions::ProhibitVersionStrings]
+
+[Modules::ProhibitExcessMainComplexity]
+max_mccabe = 30

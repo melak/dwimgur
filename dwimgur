@@ -104,8 +104,10 @@ package Image {
         my ($self) = @_;
 
         sprintf("type=image name=[%s] link=[%s] deletelink=[%s] deletecommand=[%s]",
-                $self->file, $self->link, $self->delete_link, $self->delete_command);
+                $self->delete_after_upload ? '<deleted>' : $self->file,
+                $self->link, $self->delete_link, $self->delete_command);
     };
+    has delete_after_upload => 0;
 }
 
 package Album {
@@ -199,17 +201,13 @@ my $images = Mojo::Collection->new;
 my $album = Album->new;
 my $logger = Logger->new;
 
-for my $item (@ARGV)
+if($ARGV[0] eq '-s')
 {
-    if(-r $item
-       and $item =~ m{\.(jpe?g|png)$}ni)
-    {
-        push @{$images}, Image->new(path => $item);
-    }
-    else
-    {
-        say "$item: File does not exist, is not readable or not an image";
-    }
+    image_from_screenshot($images);
+}
+else
+{
+    images_from_list($images, \@ARGV);
 }
 
 my $ua = Mojo::UserAgent->new;
@@ -243,6 +241,11 @@ $images->each(sub {
 
         $logger->write($item->history_line);
         $item->uploaded(1);
+        if($item->delete_after_upload)
+        {
+            unlink $item->path if $item->delete_after_upload;
+            $item->file('<deleted>');
+        }
         say "Uploaded " . $item->path;
     }
     else
@@ -316,6 +319,46 @@ sub sanitize ## no critic (Subroutines::RequireArgUnpacking)
     return $_[0] =~ s{[^0-9a-zA-Z]}{}griaa;
 }
 
+sub images_from_list
+{
+    my ($img, $argv) = @_;
+
+    for my $item (@{$argv})
+    {
+        if(-r $item
+           and $item =~ m{\.(jpe?g|png)$}ni)
+        {
+            push @{$img}, Image->new(path => $item);
+        }
+        else
+        {
+            say "$item: File does not exist, is not readable or not an image";
+        }
+    }
+
+    return;
+}
+
+sub image_from_screenshot
+{
+    my ($img) = @_;
+
+    my $temp = Mojo::File->tempfile(
+                    DIR => $ENV{TMPDIR} || '/tmp',
+                    TEMPLATE => '.' . Constants->instance->APPNAME . '.XXXXXXXX'
+               )->to_string;
+    system { 'maim' } 'maim', '-s', '-k', '-f', 'png', $temp;
+    if($? != 0)
+    {
+        say "Screenshot interrupted, nothing was uploaded.";
+        exit 1;
+    }
+
+    push @{$img}, Image->new(path => $temp, delete_after_upload => 1);
+
+    return;
+}
+
 __END__
 
 =head1 NAME
@@ -325,18 +368,30 @@ B<dwimgur> - No-nonsense anonymous(-only) imgur client
 =head1 SYNOPSIS
 
  dwimgur imagefile [imagefile ...]
+ dwimgur -s
 
 =head1 DESCRIPTION
 
-Uploads image files listed on the command line to L<imgur|https://imgur.com>. Each image is uploaded
-at most once. If more than one image is uploaded, an album (using the I<blog> layout) is also created.
-A summary, containing direct links to the uploaded images (and perhaps the album), is displayed.
-Only files with I<.jpg>, I<.jpeg> and I<.png> extensions are considered. Images are stripped of all
-EXIF tags before they are uploaded (the image files specified on the command line are left unharmed).
+Uploads image files listed on the command line or a screenshot taken to L<imgur|https://imgur.com>.
+Each image is uploaded at most once. If more than one image is uploaded, an album (using the I<blog>
+layout) is also created.  A summary, containing direct links to the uploaded images (and perhaps the
+album), is displayed. Only files with I<.jpg>, I<.jpeg> and I<.png> extensions are considered. Images
+are stripped of all EXIF tags before they are uploaded (the image files specified on the command line
+are left unharmed).
 
 A journal of images uploaded and albums created is recorded in F<$XDG_CONFIG_HOME/dwimgur/history>
 (defaulting to F<~/.config/dwimgur/history>). The journal also contains links and shell commands
 to delete the images and the albums.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<-s>
+
+Take a screenshot of a selection (using maim) and upload the resulting image.
+
+=back
 
 =head1 CONFIGURATION
 

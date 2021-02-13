@@ -194,7 +194,7 @@ use Mojo::URL;
 use Mojo::UserAgent;
 use Pod::Usage;
 
-pod2usage(-exitval => 1, -verbose => 1) if !@ARGV;
+pod2usage(-exitval => 1, -verbose => 0) if !@ARGV;
 pod2usage(-exitval => 0, -verbose => 2, -noperldoc => 1) if $ARGV[0] =~ m{^--?(h(elp)?)|\?}n;
 
 my $images = Mojo::Collection->new;
